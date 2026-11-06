@@ -1,6 +1,10 @@
 "use strict";
 
 var currentId = "";
+var lastStatus = null;
+var pollToken = 0;
+var POLL_INTERVAL_MS = 2000;
+var POLL_MAX_READS = 40;
 
 function el(tag, className, text) {
   var node = document.createElement(tag);
@@ -50,6 +54,54 @@ function api(path, options) {
   });
 }
 
+function selectedProjectId() {
+  var raw = String(location.hash || "").replace(/^#/, "");
+  return /^[0-9a-f]{32}$/.test(raw) ? raw : "";
+}
+
+function rememberProject(id) {
+  if (!/^[0-9a-f]{32}$/.test(id)) return;
+  if (selectedProjectId() === id) return;
+  history.replaceState(null, "", location.pathname + location.search + "#" + id);
+}
+
+function stopWatch() {
+  pollToken += 1;
+}
+
+function denied(error) {
+  var status = error && error.status;
+  return status === 401 || status === 403 || status === 404;
+}
+
+function stopAfterReadError(error) {
+  if (denied(error)) {
+    clearSelection();
+    showError((error && error.message) || "This project is not available.");
+    return;
+  }
+  stopWatch();
+  showError((error && error.message) || "The saved project could not be read. Open it again. Do not press Run next step again.");
+}
+
+function clearSelection() {
+  stopWatch();
+  currentId = "";
+  var panel = document.getElementById("open-panel");
+  var root = document.getElementById("project");
+  if (panel) panel.hidden = true;
+  if (root) clear(root);
+  if (location.hash) {
+    history.replaceState(null, "", location.pathname + location.search);
+  }
+  var run = document.getElementById("run");
+  if (run) run.disabled = false;
+}
+
+function stepIsRunning(project) {
+  return (project.steps || []).some(function (step) { return step.status === "running"; });
+}
+
 function renderList(projects) {
   var list = document.getElementById("projects");
   clear(list);
@@ -67,9 +119,11 @@ function renderList(projects) {
 
 function renderProject(project) {
   currentId = project.id;
+  rememberProject(project.id);
   var root = document.getElementById("project");
   clear(root);
   document.getElementById("open-panel").hidden = false;
+  document.getElementById("run").disabled = stepIsRunning(project);
   root.appendChild(el("h2", null, project.title));
   root.appendChild(el("p", null, "Project status: " + project.status));
   root.appendChild(el("p", "muted", project.endpoint_url + " · " + project.model));
@@ -97,12 +151,54 @@ function loadProjects() {
   });
 }
 
+function watchProject(id, token, readsSoFar) {
+  if (token !== pollToken || currentId !== id) return;
+  if (readsSoFar >= POLL_MAX_READS) {
+    showError("This step is still marked running on the server. Open the project again to read the saved result. Do not press Run next step again.");
+    return;
+  }
+  setTimeout(function () {
+    if (token !== pollToken || currentId !== id) return;
+    api("/api/role-workflow/projects/" + encodeURIComponent(id)).then(function (project) {
+      if (token !== pollToken || !project || project.id !== id) return;
+      renderProject(project);
+      if (!stepIsRunning(project)) return;
+      watchProject(id, token, readsSoFar + 1);
+    }).catch(function (error) {
+      if (token !== pollToken) return;
+      stopAfterReadError(error);
+    });
+  }, POLL_INTERVAL_MS);
+}
+
+function watchIfRunning(project) {
+  if (!project || !stepIsRunning(project)) {
+    stopWatch();
+    return;
+  }
+  var token = ++pollToken;
+  watchProject(project.id, token, 1);
+}
+
 function openProject(id) {
+  stopWatch();
   showError("");
+  currentId = "";
+  document.getElementById("open-panel").hidden = true;
+  clear(document.getElementById("project"));
   return api("/api/role-workflow/projects/" + encodeURIComponent(id)).then(function (project) {
+    if (!project || project.id !== id) {
+      clearSelection();
+      showError("This project is not available.");
+      return null;
+    }
     renderProject(project);
+    watchIfRunning(project);
+    return project;
   }).catch(function (error) {
-    showError(error.message);
+    if (denied(error)) clearSelection();
+    showError(error.message || "This project is not available.");
+    return null;
   });
 }
 
@@ -115,8 +211,6 @@ function fillSelect(select, options, selected) {
     select.appendChild(node);
   });
 }
-
-var lastStatus = null;
 
 function loadForm(status) {
   fillSelect(
@@ -172,17 +266,30 @@ document.getElementById("create-form").addEventListener("submit", function (even
 });
 
 document.getElementById("run").addEventListener("click", function () {
-  if (!currentId) return;
+  if (!currentId || document.getElementById("run").disabled) return;
+  var id = currentId;
+  var token = ++pollToken;
   showError("");
-  api("/api/role-workflow/projects/" + encodeURIComponent(currentId) + "/run", {
+  document.getElementById("run").disabled = true;
+  api("/api/role-workflow/projects/" + encodeURIComponent(id) + "/run", {
     method: "POST",
     body: "{}",
   }).then(function (project) {
+    if (token !== pollToken) return;
     renderProject(project);
+    watchIfRunning(project);
     return loadProjects();
   }).catch(function (error) {
-    showError(error.message);
-    return openProject(currentId);
+    if (token !== pollToken) return;
+    showError("The run request ended before the browser received the result (" + (error.message || "request failed") + "). Checking the saved project. This does not start another run.");
+    api("/api/role-workflow/projects/" + encodeURIComponent(id)).then(function (project) {
+      if (token !== pollToken || !project || project.id !== id) return;
+      renderProject(project);
+      if (stepIsRunning(project)) watchProject(id, token, 1);
+    }).catch(function (readError) {
+      if (token !== pollToken) return;
+      stopAfterReadError(readError);
+    });
   });
 });
 
@@ -194,6 +301,7 @@ document.getElementById("recover").addEventListener("click", function () {
     body: "{}",
   }).then(function (project) {
     renderProject(project);
+    watchIfRunning(project);
   }).catch(function (error) { showError(error.message); });
 });
 
@@ -216,7 +324,11 @@ api("/api/role-workflow/status").then(function (status) {
     document.getElementById("connect-local").disabled = true;
     return;
   }
-  return loadForm(status).then(loadProjects);
+  return loadForm(status).then(loadProjects).then(function () {
+    var selected = selectedProjectId();
+    if (selected) return openProject(selected);
+    return null;
+  });
 }).catch(function (error) {
   showError(error.message);
   document.getElementById("create").disabled = true;

@@ -173,39 +173,19 @@ app.add_middleware(SecurityHeadersMiddleware)
 # If a single request takes longer than REQUEST_HARD_TIMEOUT, abort it and
 # return 504 instead of holding the event loop hostage. Whitelisted paths
 # (streaming, long-running shell exec, research) are exempt because they
-# legitimately stay open. Without this, a single hung subprocess.run or
-# missing-timeout httpx call locks up the entire server for everyone.
-import asyncio as _asyncio
+# legitimately stay open. The role-workflow run route is exempt on its own:
+# that handler's model client stops at 120s, and cutting it at 45s returns
+# 504 while the sync handler can still commit. Without this middleware, a
+# single hung subprocess.run or missing-timeout httpx call locks up the
+# entire server for everyone. The default 45s ceiling is unchanged.
 from starlette.middleware.base import BaseHTTPMiddleware as _BaseHTTPMiddleware
-from starlette.responses import JSONResponse as _JSONResponse
 
-REQUEST_HARD_TIMEOUT = float(os.getenv("REQUEST_HARD_TIMEOUT", "45"))
-_TIMEOUT_EXEMPT_PREFIXES = (
-    "/api/chat",            # streaming
-    "/api/shell/stream",    # SSE
-    "/api/research",        # multi-minute jobs
-    "/api/model/download",  # tmux setup may run pip installs
-    "/api/model/probe",     # SSE; iterates models with up to 8s timeout each
-    "/api/model-endpoints", # /probe sub-route also iterates models
-    "/api/cookbook/setup",  # remote pacman/apt installs
-    "/api/upload",          # large files
-    "/api/image",           # diffusion proxies (inpaint/harmonize/upscale/etc.) — own 120s httpx timeout
-    "/api/memory/audit",    # retains own 120s LLM inactivity timeout
-)
+from src.request_timeout import call_with_hard_timeout
 
 
 class _RequestTimeoutMiddleware(_BaseHTTPMiddleware):
     async def dispatch(self, request, call_next):
-        path = request.url.path or ""
-        if any(path.startswith(p) for p in _TIMEOUT_EXEMPT_PREFIXES):
-            return await call_next(request)
-        try:
-            return await _asyncio.wait_for(call_next(request), timeout=REQUEST_HARD_TIMEOUT)
-        except _asyncio.TimeoutError:
-            return _JSONResponse(
-                {"detail": f"Request exceeded {REQUEST_HARD_TIMEOUT:.0f}s timeout"},
-                status_code=504,
-            )
+        return await call_with_hard_timeout(request, call_next)
 
 
 class _InteractiveActivityMiddleware(_BaseHTTPMiddleware):

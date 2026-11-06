@@ -1531,6 +1531,95 @@ def test_private_connection_is_owner_scoped_and_does_not_probe(monkeypatch, clie
     assert len(calls) == 1
 
 
+def test_late_completion_is_readable_without_another_run(monkeypatch):
+    project = _create(title="Late save")
+    started = threading.Event()
+    release = threading.Event()
+    calls = []
+
+    def post(url, **kwargs):
+        calls.append(kwargs.get("json"))
+        started.set()
+        assert release.wait(5)
+        return _reply(url, "SAVED-LATE")
+
+    monkeypatch.setattr(role_workflow.httpx, "post", post)
+    holder = {}
+
+    def worker():
+        try:
+            holder["project"] = run_next(OWNER, project["id"])
+        except WorkflowClosed as exc:
+            holder["error"] = exc
+
+    thread = threading.Thread(target=worker)
+    thread.start()
+    assert started.wait(5)
+    midway = get_project(OWNER, project["id"])
+    assert _step(midway, "writer")["status"] == "running"
+    assert _step(midway, "writer")["output_text"] == ""
+    assert len(calls) == 1
+    release.set()
+    thread.join(5)
+    assert "error" not in holder
+    saved = get_project(OWNER, project["id"])
+    assert _step(saved, "writer")["output_text"] == "SAVED-LATE"
+    assert _step(saved, "writer")["status"] == "completed"
+    reread = get_project(OWNER, project["id"])
+    assert _step(reread, "writer")["output_text"] == "SAVED-LATE"
+    assert len(calls) == 1
+    assert calls[0]["options"]["num_ctx"] == 2048
+
+
+def test_role_run_timeout_is_narrow(monkeypatch):
+    import asyncio
+
+    from fastapi import FastAPI
+    from fastapi.responses import JSONResponse
+
+    import src.request_timeout as request_timeout
+
+    project_id = "ab" * 16
+    run_path = f"/api/role-workflow/projects/{project_id}/run"
+    assert request_timeout.is_role_workflow_run(run_path)
+    assert not request_timeout.is_role_workflow_run(f"/api/role-workflow/projects/{project_id}/recover")
+    assert not request_timeout.is_role_workflow_run("/api/role-workflow/connection")
+    assert not request_timeout.is_role_workflow_run("/api/role-workflow/projects")
+    assert request_timeout.request_hard_timeout_exempt("/api/chat")
+    assert request_timeout.request_hard_timeout_exempt("/api/memory/audit")
+
+    monkeypatch.setattr(request_timeout, "REQUEST_HARD_TIMEOUT", 0.05)
+    app = FastAPI()
+
+    @app.middleware("http")
+    async def timeout_gate(request, call_next):
+        return await request_timeout.call_with_hard_timeout(request, call_next)
+
+    @app.post(run_path)
+    async def slow_run():
+        await asyncio.sleep(0.2)
+        return {"saved": True}
+
+    @app.post("/api/role-workflow/projects/{project_id}/recover")
+    async def slow_recover(project_id: str):
+        await asyncio.sleep(0.2)
+        return {"saved": True}
+
+    @app.get("/api/slow-ordinary")
+    async def slow_ordinary():
+        await asyncio.sleep(0.2)
+        return {"ok": True}
+
+    with TestClient(app) as client:
+        assert client.post(run_path).status_code == 200
+        recover = client.post(f"/api/role-workflow/projects/{project_id}/recover")
+        assert recover.status_code == 504
+        ordinary = client.get("/api/slow-ordinary")
+        assert ordinary.status_code == 504
+        assert "45" not in ordinary.text
+        assert isinstance(ordinary.json()["detail"], str)
+
+
 def test_role_dependency_closures_are_pinned():
     safety = (ROOT / "requirements-role-safety.txt").read_text(encoding="utf-8")
     runtime = (ROOT / "requirements-role-runtime.txt").read_text(encoding="utf-8")

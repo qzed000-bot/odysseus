@@ -12,6 +12,11 @@ step also refuses to call the model unless `ODYSSEUS_OLLAMA_MAX_NUM_CTX` is
 
 `Run next step` runs the first step that is not already completed. That is one
 model completion. It does not run the other two roles in the same request.
+That one request is allowed to outlast the ordinary 45-second page timeout,
+because its own model client stops at 120 seconds. If the browser stops
+waiting, the page reads the saved project and does not send the run again.
+Opening a project, including after a reload, is a read. The address keeps the
+selected project id. A missing or forbidden id clears the page.
 The server builds the step input from the saved brief and any saved earlier
 outputs, then stores the reply before the next step can start. Critic and
 Organiser do not run until `Run next step` is pressed again.

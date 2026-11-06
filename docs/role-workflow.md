@@ -28,35 +28,48 @@ retry sends a new completion.
 
 `Cancel in-flight step` asks the running request in this process to discard an
 unsaved reply. It does not delete a reply that was already saved. Closing the
-page does not cancel a request that is already in flight. Two Odysseus
-processes do not share the in-process lock; run one server.
+page does not cancel a request that is already in flight. Cancel in another
+process does not clear a step that is still running.
 
 Saved model text is untrusted text. It is not executed, and a mocked critic
 reply is not a reviewed judgement.
 
 ## What it will call
 
-The pinned endpoint must be `http` on `127.0.0.1`, `localhost`, or `::1`,
-port `11434`, with an Ollama-shaped path such as `/v1`. The intended model
-allowlist is `qwen2.5:7b-instruct`. On every run the server checks that the
-endpoint still exists, is enabled, belongs to the signed-in user or is shared,
-and still has that exact URL and an allowlisted model. Otherwise the step
-fails and no completion is sent.
+The pinned endpoint must be `http` on numeric loopback port `11434`, with an
+Ollama-shaped path such as `/v1`. The hostname `localhost` is stored as
+`127.0.0.1` and is not resolved. `::1` is accepted as written. The intended
+model allowlist is `qwen2.5:7b-instruct`. On every create and run the server
+checks three gates together: the workflow allowlist, the signed-in account's
+current model list (`block_all_models` and `allowed_models`), and the
+endpoint. The endpoint must still exist, be enabled, belong to that user or
+have no owner, and still be that numeric URL. Otherwise the step fails and
+no completion is sent. An endpoint owned by another account stays hidden.
+This workflow does not mark endpoints shared.
 
-A guarded `/v1` base is posted to loopback `/api/chat` with `options.num_ctx`
-2048 and `options.num_predict` 512. Redirects are not followed. There is no
-fallback model, endpoint, or provider. `ODYSSEUS_OLLAMA_CONTEXT_BASES` does
-not add hosts or ports for this workflow.
+A guarded `/v1` base is posted to numeric loopback `/api/chat` with
+`options.num_ctx` 2048 and `options.num_predict` 512. The post does not use
+`HTTP_PROXY`, `ALL_PROXY`, or their lowercase forms, and it does not follow
+redirects. There is no fallback model, endpoint, or provider.
+`ODYSSEUS_OLLAMA_CONTEXT_BASES` does not add hosts or ports for this workflow.
 
-The prompt must fit a conservative budget of 1536 input tokens plus the
-512-token completion. The bound is the larger of the shared character
-estimator and a fixed rule: one token per two Latin characters, and two
-tokens per non-ASCII character. Saved text is not shortened to make it fit.
-If it does not fit, the step fails before the call.
+The prompt must fit 1536 input tokens beside the 512-token completion. Each
+message counts as its UTF-8 byte length plus 8 tokens of framing. Newlines,
+emoji, and dense text are counted by encoded size. Saved text is not
+shortened to make it fit. If it does not fit, the step fails before the call.
+No tokenizer or embedding model is downloaded. A real tokenizer may have
+accepted some prompts this bound rejects. That is intentional. There is no
+setting that raises 2048 or 512.
 
-That bound is not a tokenizer. A character that becomes more tokens than the
-rule allows can still exceed a 2048 window. No tokenizer or embedding model
-is downloaded to close that gap.
+One model call runs at a time for a shared SQLite file. The lock is a file
+beside that database (`<database>.role-workflow.lock`), held from the moment
+a step is accepted until its result is saved, and the operating system
+releases it when the process exits. Another process that shares the file gets
+a conflict on Run and on Recover while the lock is held, and it does not
+clear the active step or start a second call. An in-memory database cannot
+be shared across processes; only threads in that one process are serialized.
+This does not coordinate two database servers. A reply that was generated
+and never saved can still be generated again after an explicit Recover.
 
 ## What it will not call
 

@@ -15,6 +15,7 @@ from pydantic import BaseModel
 from src.auth_helpers import require_user
 from src.role_workflow import (
     WorkflowClosed,
+    account_models_from_privileges,
     cancel_project,
     create_project,
     feature_enabled,
@@ -39,6 +40,22 @@ def _owner(request: Request) -> str:
     if not user or user in {"api", "internal-tool"}:
         raise HTTPException(status_code=401, detail="Not authenticated")
     return user
+
+
+def _account_models(request: Request, owner: str):
+    """Current account model gate. Missing auth state means no account list.
+
+    Capability flags are not consulted. A present account that cannot be
+    read fails closed.
+    """
+    auth_manager = getattr(getattr(request, "app", None).state, "auth_manager", None)
+    if auth_manager is None or not hasattr(auth_manager, "get_privileges"):
+        return None
+    try:
+        privs = auth_manager.get_privileges(owner)
+    except Exception as exc:
+        raise WorkflowClosed("model access could not be verified", 403) from exc
+    return account_models_from_privileges(privs)
 
 
 def _feature_or_404() -> None:
@@ -95,6 +112,7 @@ def setup_role_workflow_routes() -> APIRouter:
                 brief=body.brief,
                 endpoint_id=body.endpoint_id,
                 model=body.model,
+                account_models=_account_models(request, owner),
             )
         except WorkflowClosed as exc:
             raise _closed(exc) from exc
@@ -113,7 +131,7 @@ def setup_role_workflow_routes() -> APIRouter:
         _feature_or_404()
         owner = _owner(request)
         try:
-            return run_next(owner, project_id)
+            return run_next(owner, project_id, _account_models(request, owner))
         except WorkflowClosed as exc:
             raise _closed(exc) from exc
 

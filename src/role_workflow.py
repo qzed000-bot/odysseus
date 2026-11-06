@@ -18,6 +18,7 @@ import logging
 import os
 import threading
 import uuid
+from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse, urlunparse
 
@@ -35,6 +36,9 @@ DEFAULT_MODEL = "qwen2.5:7b-instruct"
 MAX_CONTEXT_TOKENS = 2048
 MAX_COMPLETION_TOKENS = 512
 INPUT_TOKEN_BUDGET = MAX_CONTEXT_TOKENS - MAX_COMPLETION_TOKENS
+# Chat framing counted with the text. One token per UTF-8 byte plus this
+# overhead is the upper bound. It is not configurable.
+MESSAGE_OVERHEAD_TOKENS = 8
 MAX_TITLE_CHARS = 120
 MAX_BRIEF_CHARS = 4000
 MAX_OUTPUT_CHARS = 8000
@@ -62,8 +66,7 @@ INSTRUCTIONS = {
     "organiser": ORGANISER_INSTRUCTION,
 }
 
-_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
-_RUN_LOCK = threading.Lock()
+_NUMERIC_LOOPBACK = {"127.0.0.1", "::1"}
 _CANCEL_LOCK = threading.Lock()
 _CANCEL_EVENTS: dict[str, threading.Event] = {}
 _TABLES_READY = False
@@ -111,6 +114,7 @@ class RoleStep(Base):
     output_text = Column(Text, nullable=False, default="")
     status = Column(String, nullable=False, default="pending")
     error = Column(Text, nullable=False, default="")
+    attempt_id = Column(String, nullable=True)
     created_at = Column(String, nullable=False)
     updated_at = Column(String, nullable=False)
 
@@ -141,7 +145,11 @@ def allowed_models() -> tuple[str, ...]:
 
 
 def ensure_tables() -> None:
-    """Create only this feature's tables. Existing tables are not altered."""
+    """Create this feature's tables and add any missing column.
+
+    Existing rows and unrelated tables are left in place. A missing
+    ``attempt_id`` column is added. Columns are not dropped or rewritten.
+    """
     global _TABLES_READY
     if _TABLES_READY:
         return
@@ -150,35 +158,47 @@ def ensure_tables() -> None:
             return
         RoleProject.__table__.create(bind=engine, checkfirst=True)
         RoleStep.__table__.create(bind=engine, checkfirst=True)
+        _ensure_attempt_column()
         _TABLES_READY = True
 
 
+def _ensure_attempt_column() -> None:
+    from sqlalchemy import inspect, text
+
+    try:
+        columns = {col["name"] for col in inspect(engine).get_columns(RoleStep.__tablename__)}
+    except Exception:
+        return
+    if "attempt_id" in columns:
+        return
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE role_workflow_steps ADD COLUMN attempt_id VARCHAR"))
+
+
 def prompt_token_bound(messages: list[dict]) -> int:
-    """Conservative input-token bound with no tokenizer download.
+    """Upper bound on input tokens with no tokenizer download.
 
-    Uses the larger of the shared character estimator and a fixed rule:
-    one token per two Latin characters, and two tokens per non-ASCII
-    character, plus a small per-message overhead. This rejects some prompts
-    a real tokenizer would accept.
-
-    Residual limitation: a Latin character that becomes more than one token,
-    or a non-ASCII character that becomes more than two, can still exceed
-    the window. Those prompts are not detected here. The workflow rejects
-    when this bound does not fit and does not shorten saved text to force a fit.
+    Every UTF-8 byte of message text counts as one token, plus
+    ``MESSAGE_OVERHEAD_TOKENS`` per message for role and chat framing.
+    A byte-fallback tokenizer cannot exceed this. Newlines, emoji, and
+    dense letters are counted by their encoded size, not by a character
+    ratio. Prompts a real tokenizer would still fit can be rejected.
+    Saved text is not shortened when the bound does not fit.
     """
-    from src.model_context import estimate_tokens
-
-    chars = 0
-    non_ascii = 0
+    if not isinstance(messages, list):
+        raise WorkflowClosed("prompt content must be plain text", 400)
+    total = 0
     for message in messages:
-        text = message.get("content") or ""
-        if not isinstance(text, str):
-            text = str(text)
-        chars += len(text)
-        non_ascii += sum(1 for ch in text if ord(ch) > 127)
-    latin = chars - non_ascii
-    char_bound = (latin + 1) // 2 + (non_ascii * 2) + (8 * len(messages))
-    return max(estimate_tokens(messages), char_bound)
+        if not isinstance(message, dict):
+            raise WorkflowClosed("prompt content must be plain text", 400)
+        content = message.get("content")
+        if content is None:
+            content = ""
+        if not isinstance(content, str):
+            raise WorkflowClosed("prompt content must be plain text", 400)
+        total += len(content.encode("utf-8"))
+        total += MESSAGE_OVERHEAD_TOKENS
+    return total
 
 
 def build_messages(role: str, brief: str, outputs: dict[str, str]) -> list[dict]:
@@ -201,28 +221,36 @@ def build_messages(role: str, brief: str, outputs: dict[str, str]) -> list[dict]
 
 
 def normalize_loopback_ollama_url(url: str) -> str:
-    """Accept only http loopback port 11434 Ollama-shaped paths.
+    """Accept only http numeric loopback port 11434 Ollama-shaped paths.
 
-    ``ODYSSEUS_OLLAMA_CONTEXT_BASES`` cannot widen this set. Credentials,
-    queries, fragments, other schemes, other ports, and non-loopback hosts
-    are refused. The path is stored in lowercase so a later edit that only
-    changes case still has to match this canonical form.
+    The hostname ``localhost`` is rewritten to ``127.0.0.1`` without DNS.
+    No other name is resolved, so a hosts-file change cannot point the post
+    off the machine. ``ODYSSEUS_OLLAMA_CONTEXT_BASES`` cannot widen this set.
+    Credentials, queries, fragments, other schemes, other ports, and
+    non-loopback hosts are refused. A port that is not an integer is a
+    client error, not a server error.
     """
     if not isinstance(url, str) or url.strip() == "" or url != url.strip():
         raise WorkflowClosed("endpoint URL is malformed", 400)
     if any(ch in url for ch in ("\r", "\n", "\t", " ")):
         raise WorkflowClosed("endpoint URL is malformed", 400)
-    parsed = urlparse(url)
+    try:
+        parsed = urlparse(url)
+        port = parsed.port
+        host = (parsed.hostname or "").lower().rstrip(".")
+    except ValueError as exc:
+        raise WorkflowClosed("endpoint URL is malformed", 400) from exc
     if parsed.scheme != "http":
         raise WorkflowClosed("endpoint URL must be http on loopback port 11434", 400)
     if parsed.username or parsed.password:
         raise WorkflowClosed("endpoint URL must not include credentials", 400)
     if parsed.query or parsed.fragment:
         raise WorkflowClosed("endpoint URL must not include a query or fragment", 400)
-    host = (parsed.hostname or "").lower().rstrip(".")
-    if host not in _LOOPBACK_HOSTS:
-        raise WorkflowClosed("endpoint URL must be loopback", 400)
-    if parsed.port != 11434:
+    if host == "localhost":
+        host = "127.0.0.1"
+    if host not in _NUMERIC_LOOPBACK:
+        raise WorkflowClosed("endpoint URL must be numeric loopback", 400)
+    if port != 11434:
         raise WorkflowClosed("endpoint URL must use port 11434", 400)
     path = parsed.path or ""
     if "\\" in path or any(part == ".." for part in path.split("/")):
@@ -242,6 +270,138 @@ def normalize_loopback_ollama_url(url: str) -> str:
 def _require_enabled() -> None:
     if not feature_enabled():
         raise WorkflowClosed("Not found", 404)
+
+
+def account_models_from_privileges(privs: dict) -> Optional[frozenset]:
+    """Account model gate, matching the chat allowlist rule.
+
+    ``None`` means the account has no model restriction. An empty set means
+    the account may use no model. Capability flags are not read here.
+    """
+    if not isinstance(privs, dict):
+        raise WorkflowClosed("model access could not be verified", 403)
+    if privs.get("block_all_models"):
+        return frozenset()
+    allowed_raw = privs.get("allowed_models")
+    allowed = allowed_raw if isinstance(allowed_raw, list) else []
+    restricted = bool(privs.get("allowed_models_restricted")) or bool(allowed)
+    if not restricted:
+        return None
+    return frozenset(model for model in allowed if isinstance(model, str))
+
+
+def _assert_account_model(model: str, account_models: Optional[frozenset]) -> None:
+    if account_models is None:
+        return
+    if model not in account_models:
+        raise WorkflowClosed("your account is not allowed to use this model", 403)
+
+
+def workflow_lock_path() -> Path:
+    """Lock file shared by every process that uses this database file.
+
+    An in-memory database has no shared file. Those processes only serialize
+    threads inside one process, because they cannot see each other's rows.
+    """
+    url = engine.url
+    database = url.database
+    if (
+        url.get_backend_name() == "sqlite"
+        and database
+        and database != ":memory:"
+        and not str(database).lower().startswith("file:")
+    ):
+        db_path = Path(database)
+        if not db_path.is_absolute():
+            db_path = Path.cwd() / db_path
+        return db_path.resolve().with_name(db_path.name + ".role-workflow.lock")
+    from src.constants import DATA_DIR
+    digest = uuid.uuid5(uuid.NAMESPACE_URL, str(url)).hex[:16]
+    return Path(DATA_DIR) / f"role-workflow-{digest}.lock"
+
+
+def _try_file_lock(fd: int) -> bool:
+    try:
+        if os.name == "nt":
+            import msvcrt
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except (BlockingIOError, OSError):
+        return False
+
+
+def _unlock_file(fd: int) -> None:
+    try:
+        if os.name == "nt":
+            import msvcrt
+            try:
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+            except OSError:
+                pass
+        else:
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+class _WorkflowLock:
+    """One model call at a time for this database, across threads and processes.
+
+    The thread lock covers one process. The OS file lock covers every process
+    that opens the same database file. The operating system drops the file
+    lock when the process exits, including a hard exit. The database itself
+    is not held open during the model call.
+    """
+
+    def __init__(self) -> None:
+        self._thread = threading.Lock()
+        self._fd: Optional[int] = None
+
+    def locked(self) -> bool:
+        return self._thread.locked()
+
+    def acquire(self, blocking: bool = False) -> bool:
+        if blocking:
+            return False
+        if not self._thread.acquire(blocking=False):
+            return False
+        fd = None
+        try:
+            path = workflow_lock_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(os.fspath(path), os.O_CREAT | os.O_RDWR, 0o600)
+            if not _try_file_lock(fd):
+                os.close(fd)
+                self._thread.release()
+                return False
+            self._fd = fd
+            return True
+        except Exception:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            self._thread.release()
+            raise
+
+    def release(self) -> None:
+        fd = self._fd
+        self._fd = None
+        try:
+            if fd is not None:
+                _unlock_file(fd)
+        finally:
+            self._thread.release()
+
+
+_RUN_LOCK = _WorkflowLock()
 
 
 def _now() -> str:
@@ -359,8 +519,17 @@ def _load_endpoint(db, endpoint_id: str, owner: str) -> ModelEndpoint:
     return endpoint
 
 
-def _assert_pin(db, project: RoleProject, owner: str) -> None:
-    """Fail closed unless the live endpoint still matches the saved pin."""
+def _assert_pin(
+    db,
+    project: RoleProject,
+    owner: str,
+    account_models: Optional[frozenset] = None,
+) -> str:
+    """Fail closed unless the live endpoint still matches the saved pin.
+
+    Returns the numeric loopback URL to post. Account model restrictions are
+    read from the privileges passed in, not from capability flags.
+    """
     from src.ollama_context_guard import (
         OllamaContextGuardRejected,
         guard_mode,
@@ -374,12 +543,14 @@ def _assert_pin(db, project: RoleProject, owner: str) -> None:
         )
     if project.model not in allowed_models():
         raise WorkflowClosed("pinned model is no longer allowed", 400)
+    _assert_account_model(project.model, account_models)
     endpoint = _load_endpoint(db, project.endpoint_id, owner)
     try:
         current = normalize_loopback_ollama_url(endpoint.base_url or "")
+        stored = normalize_loopback_ollama_url(project.endpoint_url or "")
     except WorkflowClosed as exc:
         raise WorkflowClosed("pinned endpoint URL is no longer allowed", 400) from exc
-    if current != project.endpoint_url:
+    if current != stored:
         raise WorkflowClosed("pinned endpoint URL changed", 400)
     try:
         guarded = is_guarded_local_ollama(current)
@@ -387,16 +558,21 @@ def _assert_pin(db, project: RoleProject, owner: str) -> None:
         raise WorkflowClosed(str(exc), 400) from exc
     if not guarded:
         raise WorkflowClosed("pinned endpoint is not a guarded local Ollama listener", 400)
+    return current
 
 
 def _assert_post_url(url: str) -> None:
-    parsed = urlparse(url)
-    host = (parsed.hostname or "").lower()
+    try:
+        parsed = urlparse(url)
+        port = parsed.port
+        host = (parsed.hostname or "").lower()
+    except ValueError as exc:
+        raise WorkflowClosed("refusing to post the completion anywhere but loopback /api/chat", 400) from exc
     path = (parsed.path or "").rstrip("/")
     if (
         parsed.scheme != "http"
-        or host not in _LOOPBACK_HOSTS
-        or parsed.port != 11434
+        or host not in _NUMERIC_LOOPBACK
+        or port != 11434
         or path != "/api/chat"
         or parsed.username
         or parsed.query
@@ -480,13 +656,23 @@ def complete_text(url: str, model: str, messages: list[dict]) -> str:
             raise WorkflowClosed("refusing to send tool-call messages", 400)
     post_url = _ollama_post_url(url)
     _assert_post_url(post_url)
+    if prompt_token_bound(payload.get("messages") or []) > INPUT_TOKEN_BUDGET:
+        raise WorkflowClosed(
+            "prompt does not fit the 2048 context budget and was not shortened",
+            400,
+        )
     try:
+        # trust_env is false so HTTP_PROXY, ALL_PROXY, and the lowercase
+        # variants cannot send this body to another host. proxy=None keeps
+        # an explicit client proxy from being attached either.
         response = httpx.post(
             post_url,
             json=payload,
             headers={"Content-Type": "application/json"},
             timeout=httpx.Timeout(120.0, connect=3.0),
             follow_redirects=False,
+            trust_env=False,
+            proxy=None,
         )
     except httpx.HTTPError as exc:
         logger.warning("role workflow completion request failed: %s", type(exc).__name__)
@@ -519,26 +705,47 @@ def _outputs_so_far(steps: list[RoleStep]) -> dict[str, str]:
 
 def _persist_outcome(
     step_id: str,
+    attempt_id: str,
     status: str,
     error: str = "",
     output: Optional[str] = None,
-) -> None:
-    """Write one step outcome. A completed step is never rewritten or cleared."""
+) -> bool:
+    """Write this attempt only while the row is still that running attempt.
+
+    A later or earlier attempt does not match, so it cannot replace a saved
+    reply or clear one. Output text is written only when this attempt
+    completes. The function returns False when the row no longer belongs to
+    this attempt.
+    """
     db = SessionLocal()
     try:
-        step = db.query(RoleStep).filter(RoleStep.id == step_id).one()
-        project = db.query(RoleProject).filter(RoleProject.id == step.project_id).one()
-        if step.status == "completed":
-            return
-        step.status = status
-        step.error = (error or "")[:MAX_ERROR_CHARS]
+        values = {
+            "status": status,
+            "error": (error or "")[:MAX_ERROR_CHARS],
+            "updated_at": _now(),
+        }
         if status == "completed":
             if output is None:
                 raise WorkflowClosed("completed step is missing text", 500)
-            step.output_text = output
-            project.current_artifact = output
+            values["output_text"] = output
+        changed = (
+            db.query(RoleStep)
+            .filter(
+                RoleStep.id == step_id,
+                RoleStep.attempt_id == attempt_id,
+                RoleStep.status == "running",
+            )
+            .update(values, synchronize_session=False)
+        )
+        if changed != 1:
+            db.rollback()
+            return False
+        step = db.query(RoleStep).filter(RoleStep.id == step_id).one()
+        project = db.query(RoleProject).filter(RoleProject.id == step.project_id).one()
+        if status == "completed":
+            project.current_artifact = output or ""
             siblings = db.query(RoleStep).filter(RoleStep.project_id == project.id).all()
-            if all(item.status == "completed" or item.id == step.id for item in siblings):
+            if all(item.status == "completed" for item in siblings):
                 project.status = "completed"
             else:
                 project.status = "active"
@@ -546,9 +753,12 @@ def _persist_outcome(
             project.status = "failed"
         elif status == "interrupted":
             project.status = "held"
-        _touch(step)
         _touch(project)
         db.commit()
+        return True
+    except Exception:
+        db.rollback()
+        raise
     finally:
         db.close()
 
@@ -571,6 +781,7 @@ def create_project(
     brief: object,
     endpoint_id: object,
     model: object,
+    account_models: Optional[frozenset] = None,
 ) -> dict:
     _require_enabled()
     if not owner:
@@ -598,7 +809,7 @@ def create_project(
             created_at=_now(),
             updated_at=_now(),
         )
-        _assert_pin(db, draft, owner)
+        _assert_pin(db, draft, owner, account_models)
         db.add(draft)
         db.flush()
         for position, role in enumerate(ROLES, start=1):
@@ -718,6 +929,7 @@ def recover_project(owner: str, project_id: str) -> dict:
                 if step.status != "running":
                     continue
                 step.status = "interrupted"
+                step.attempt_id = uuid.uuid4().hex
                 step.error = (
                     "interrupted before a saved reply; run the step again to try once more. "
                     "This does not prove the model was never called."
@@ -750,7 +962,11 @@ def cancel_project(owner: str, project_id: str) -> dict:
     return {"cancel_requested": False}
 
 
-def run_next(owner: str, project_id: str) -> dict:
+def run_next(
+    owner: str,
+    project_id: str,
+    account_models: Optional[frozenset] = None,
+) -> dict:
     """Run exactly one incomplete step, or refuse if the shared model is busy."""
     _require_enabled()
     if not owner:
@@ -760,17 +976,22 @@ def run_next(owner: str, project_id: str) -> dict:
         raise WorkflowClosed("another workflow step is already running", 409)
     cancel = _arm_cancel(project_id)
     try:
-        return _run_locked(owner, project_id, cancel)
+        return _run_locked(owner, project_id, cancel, account_models)
     finally:
         _disarm_cancel(project_id)
         _RUN_LOCK.release()
 
 
-def _fail_step(step_id: str, message: str) -> None:
-    _persist_outcome(step_id, "failed", error=message)
+def _fail_step(step_id: str, attempt_id: str, message: str) -> bool:
+    return _persist_outcome(step_id, attempt_id, "failed", error=message)
 
 
-def _run_locked(owner: str, project_id: str, cancel: threading.Event) -> dict:
+def _run_locked(
+    owner: str,
+    project_id: str,
+    cancel: threading.Event,
+    account_models: Optional[frozenset] = None,
+) -> dict:
     db = SessionLocal()
     try:
         project, steps = _owned_project(db, project_id, owner)
@@ -783,7 +1004,7 @@ def _run_locked(owner: str, project_id: str, cancel: threading.Event) -> dict:
                 409,
             )
         try:
-            _assert_pin(db, project, owner)
+            pinned_url = _assert_pin(db, project, owner, account_models)
         except WorkflowClosed as exc:
             step.status = "failed"
             step.error = exc.message[:MAX_ERROR_CHARS]
@@ -806,7 +1027,9 @@ def _run_locked(owner: str, project_id: str, cancel: threading.Event) -> dict:
             raise WorkflowClosed(step.error, 400)
         if cancel.is_set():
             raise WorkflowClosed("cancelled before the step started", 409)
+        attempt_id = uuid.uuid4().hex
         step.status = "running"
+        step.attempt_id = attempt_id
         step.input_text = user_text
         step.error = ""
         project.status = "active"
@@ -815,7 +1038,7 @@ def _run_locked(owner: str, project_id: str, cancel: threading.Event) -> dict:
         db.commit()
         step_id = step.id
         role = step.role
-        url = project.endpoint_url
+        url = pinned_url
         model = project.model
     except WorkflowClosed:
         raise
@@ -826,23 +1049,26 @@ def _run_locked(owner: str, project_id: str, cancel: threading.Event) -> dict:
         db.close()
 
     if cancel.is_set():
-        _persist_outcome(step_id, "interrupted", error="cancelled before the model call")
+        _persist_outcome(step_id, attempt_id, "interrupted", error="cancelled before the model call")
         raise WorkflowClosed("cancelled before the model call", 409)
 
     try:
         text = complete_text(url, model, messages)
     except WorkflowClosed as exc:
-        _fail_step(step_id, exc.message)
+        if not _fail_step(step_id, attempt_id, exc.message):
+            raise WorkflowClosed("this attempt is no longer the saved step", 409) from exc
         raise
 
     if cancel.is_set():
         _persist_outcome(
             step_id,
+            attempt_id,
             "interrupted",
             error="cancelled; the model reply was discarded and was not saved",
         )
         raise WorkflowClosed("cancelled; the model reply was discarded", 409)
 
-    _persist_outcome(step_id, "completed", output=text)
+    if not _persist_outcome(step_id, attempt_id, "completed", output=text):
+        raise WorkflowClosed("this attempt is no longer the saved step", 409)
     logger.info("role workflow step completed project=%s role=%s", project_id, role)
     return _dump(project_id, owner)

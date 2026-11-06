@@ -497,6 +497,17 @@ VARIABLE_NOTES: dict[str, tuple[str, str, str]] = {
         "listener when ODYSSEUS_OLLAMA_MAX_NUM_CTX is enforcing. Port 11434 /v1 "
         "is included without this. An invalid entry refuses local Ollama calls.",
     ),
+    "ODYSSEUS_ROLE_WORKFLOW": (
+        "Model routing and providers", USER,
+        "Opt-in sequential Writer, Critic, and Organiser text workflow. The only "
+        "enabling value is 1. Unset or any other value leaves the workflow off. "
+        "See docs/role-workflow.md.",
+    ),
+    "ODYSSEUS_ROLE_WORKFLOW_MODELS": (
+        "Model routing and providers", USER,
+        "Comma-separated model names the sequential text workflow may call. "
+        "The default is qwen2.5:7b-instruct. This does not allow other endpoints.",
+    ),
 
     # -- Agent loop and tool execution -------------------------------------
     "ODYSSEUS_TOOL_APPROVAL_GATE": (

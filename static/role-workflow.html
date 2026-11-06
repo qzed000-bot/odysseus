@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'self'">
+  <title>Text workflow</title>
+  <link rel="stylesheet" href="/static/css/00-tokens.css?v=20260929csssplit">
+  <style>
+    body {
+      display: block;
+      overflow: auto;
+      height: auto;
+      min-height: 100%;
+      padding: 24px;
+    }
+    main { max-width: 880px; margin: 0 auto; }
+    h1, h2, h3 { font-weight: 600; }
+    p, li, label { line-height: 1.5; }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      padding: 16px;
+      margin: 16px 0;
+    }
+    label { display: block; margin: 12px 0 4px; }
+    input, select, textarea, button {
+      font: inherit;
+      color: var(--fg);
+      background: var(--bg);
+      border: 1px solid var(--border);
+      padding: 8px;
+    }
+    textarea, input[type="text"], select { width: 100%; }
+    textarea { min-height: 120px; }
+    button { cursor: pointer; margin-right: 8px; }
+    button:disabled { opacity: 0.5; cursor: default; }
+    .error { color: var(--color-error); }
+    .muted { color: var(--color-muted); }
+    pre {
+      white-space: pre-wrap;
+      word-break: break-word;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      padding: 8px;
+      margin: 4px 0 12px;
+    }
+    .project-button { display: block; width: 100%; text-align: left; margin: 0 0 8px; }
+    a { color: var(--color-link-hover); }
+  </style>
+</head>
+<body>
+  <main>
+    <p><a href="/">Back to chat</a></p>
+    <h1>Text workflow</h1>
+    <p>
+      Writer, then Critic, then Organiser. Each press of Run next step sends
+      one model request for the first step that is not completed. The server
+      puts the saved brief and any saved earlier outputs into that request.
+      Nothing is copied between chats by hand. A completed step is not run again.
+    </p>
+    <p class="muted">
+      Saved model text is not a reviewed judgement. Read it before you rely on it.
+      Recover marks a step left in running as interrupted and does not call the model.
+    </p>
+    <p id="banner" class="error"></p>
+
+    <section class="panel" id="create-panel">
+      <h2>New project</h2>
+      <form id="create-form">
+        <label for="title">Title</label>
+        <input id="title" name="title" type="text" maxlength="120" required>
+        <label for="endpoint">Local endpoint</label>
+        <select id="endpoint" name="endpoint" required></select>
+        <label for="model">Model</label>
+        <select id="model" name="model" required></select>
+        <label for="brief">Brief</label>
+        <textarea id="brief" name="brief" maxlength="4000" required placeholder="Explain in a few sentences how rain forms, for a general reader."></textarea>
+        <button id="create" type="submit">Create project</button>
+      </form>
+    </section>
+
+    <section class="panel">
+      <h2>Projects</h2>
+      <div id="projects"></div>
+    </section>
+
+    <section class="panel" id="open-panel" hidden>
+      <div id="project"></div>
+      <button id="run" type="button">Run next step</button>
+      <button id="recover" type="button">Recover held step</button>
+      <button id="cancel" type="button">Cancel in-flight step</button>
+    </section>
+  </main>
+  <script src="/static/js/role-workflow.js"></script>
+</body>
+</html>

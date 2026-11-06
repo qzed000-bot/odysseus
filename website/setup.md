@@ -421,6 +421,8 @@ Local GPU *serving* of vLLM/SGLang needs Linux/WSL2; for a local model on Window
 `http://localhost:11434/v1` in Settings. To enforce a 2048-token ceiling on that
 local Ollama listener (native or `/v1`), set `ODYSSEUS_OLLAMA_MAX_NUM_CTX=2048`.
 Details: [ollama context guard](../docs/ollama-context-guard.md).
+The optional Writer, Critic, Organiser text workflow is off unless
+`ODYSSEUS_ROLE_WORKFLOW=1`. Details: [role workflow](../docs/role-workflow.md).
 
 Open `http://localhost:7000`, log in with the generated admin password,
 and configure everything else inside **Settings**.

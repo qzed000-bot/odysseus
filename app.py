@@ -818,6 +818,11 @@ app.include_router(setup_signature_routes())
 from routes.gallery.gallery_routes import setup_gallery_routes
 app.include_router(setup_gallery_routes())
 
+# Opt-in sequential text workflow. Off unless ODYSSEUS_ROLE_WORKFLOW=1.
+# Registering the router does not start a model call, poller, or task.
+from routes.role_workflow_routes import setup_role_workflow_routes
+app.include_router(setup_role_workflow_routes())
+
 # Persisted image-editor drafts (server-backed projects)
 from routes.editor_draft_routes import setup_editor_draft_routes
 app.include_router(setup_editor_draft_routes())

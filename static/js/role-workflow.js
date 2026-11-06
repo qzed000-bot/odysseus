@@ -116,6 +116,8 @@ function fillSelect(select, options, selected) {
   });
 }
 
+var lastStatus = null;
+
 function loadForm(status) {
   fillSelect(
     document.getElementById("model"),
@@ -131,6 +133,7 @@ function loadForm(status) {
       document.getElementById("create").disabled = true;
       return;
     }
+    document.getElementById("create").disabled = false;
     fillSelect(
       document.getElementById("endpoint"),
       endpoints.map(function (endpoint) {
@@ -139,6 +142,16 @@ function loadForm(status) {
     );
   });
 }
+
+document.getElementById("connect-local").addEventListener("click", function () {
+  showError("");
+  api("/api/role-workflow/connection", { method: "POST", body: "{}" })
+    .then(function () {
+      if (!lastStatus) return null;
+      return loadForm(lastStatus);
+    })
+    .catch(function (error) { showError(error.message); });
+});
 
 document.getElementById("create-form").addEventListener("submit", function (event) {
   event.preventDefault();
@@ -196,9 +209,11 @@ document.getElementById("cancel").addEventListener("click", function () {
 });
 
 api("/api/role-workflow/status").then(function (status) {
+  lastStatus = status;
   if (!status.enabled) {
     showError("This workflow is off. It stays off until ODYSSEUS_ROLE_WORKFLOW is exactly 1 and the local Ollama context guard is 2048.");
     document.getElementById("create").disabled = true;
+    document.getElementById("connect-local").disabled = true;
     return;
   }
   return loadForm(status).then(loadProjects);

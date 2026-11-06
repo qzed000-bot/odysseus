@@ -47,6 +47,12 @@ have no owner, and still be that numeric URL. Otherwise the step fails and
 no completion is sent. An endpoint owned by another account stays hidden.
 This workflow does not mark endpoints shared.
 
+`Use this computer's local model` asks the server to save one private
+connection for the signed-in account. The server chooses
+`http://127.0.0.1:11434/v1` and `qwen2.5:7b-instruct`. The request body is
+ignored, including any owner, URL, or key. No catalog probe is sent. A
+disabled connection is not replaced. The admin endpoint list is unchanged.
+
 A guarded `/v1` base is posted to numeric loopback `/api/chat` with
 `options.num_ctx` 2048 and `options.num_predict` 512. The post does not use
 `HTTP_PROXY`, `ALL_PROXY`, or their lowercase forms, and it does not follow

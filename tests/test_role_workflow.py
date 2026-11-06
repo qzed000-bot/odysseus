@@ -817,6 +817,9 @@ def test_ui_is_text_only_and_linked():
         assert token not in html
     assert "textContent" in js
     assert "not a reviewed judgement" in html
+    assert 'id="connect-local"' in html
+    assert "/api/role-workflow/connection" in js
+    assert "require_admin" not in routes
     assert "Run next step" in html
     assert 'href="/static/role-workflow.html"' in page
     assert "setup_role_workflow_routes" in app
@@ -1394,4 +1397,162 @@ def test_process_death_releases_lock_without_a_second_call(tmp_path):
     assert status == "completed"
     assert output == "REPLY-ONCE"
     assert critic == "pending"
+
+
+def test_private_connection_is_owner_scoped_and_does_not_probe(monkeypatch, client):
+    from core.database import ModelEndpoint
+    from src.role_workflow import PRIVATE_LOOPBACK_URL
+
+    model_routes = (ROOT / "routes/model_routes.py").read_text(encoding="utf-8")
+    create_at = model_routes.find("def create_model_endpoint")
+    assert create_at > 0
+    assert "require_admin(request)" in model_routes[create_at:create_at + 2500]
+
+    calls = _install_replies(monkeypatch, ["PRIVATE-DRAFT"])
+    other = _endpoint(owner="someone-else")
+    shared = _endpoint(owner=None)
+    spoof = client.post("/api/role-workflow/connection", json={
+        "owner": "root",
+        "id": other,
+        "base_url": "https://example.com/v1",
+        "api_key": "secret",
+        "shared": True,
+        "model": "other:model",
+    })
+    assert spoof.status_code == 200
+    body = spoof.json()
+    assert body["base_url"] == PRIVATE_LOOPBACK_URL
+    assert body["model"] == MODEL
+    assert body["id"] != other
+    assert calls == []
+
+    again = client.post("/api/role-workflow/connection", json={"id": body["id"], "owner": "someone-else"})
+    assert again.status_code == 200
+    assert again.json()["id"] == body["id"]
+    db = SessionLocal()
+    try:
+        rows = db.query(ModelEndpoint).filter(ModelEndpoint.owner == OWNER).all()
+        assert len(rows) == 1
+        assert rows[0].id == body["id"]
+        assert rows[0].api_key in (None, "")
+        assert rows[0].is_enabled is True
+        assert rows[0].base_url == PRIVATE_LOOPBACK_URL
+        untouched = db.query(ModelEndpoint).filter(ModelEndpoint.id == other).one()
+        assert untouched.owner == "someone-else"
+        assert untouched.base_url == PIN
+    finally:
+        db.close()
+
+    listed = client.get("/api/role-workflow/endpoints").json()["endpoints"]
+    assert {item["id"] for item in listed} >= {body["id"], shared}
+    assert other not in {item["id"] for item in listed}
+
+    client.headers["x-test-user"] = "other-daily"
+    theirs = client.post("/api/role-workflow/connection", json={"id": body["id"], "owner": OWNER})
+    assert theirs.status_code == 200
+    assert theirs.json()["id"] != body["id"]
+    their_list = {item["id"] for item in client.get("/api/role-workflow/endpoints").json()["endpoints"]}
+    assert body["id"] not in their_list
+    assert theirs.json()["id"] in their_list
+    client.headers["x-test-user"] = OWNER
+
+    db = SessionLocal()
+    try:
+        row = db.query(ModelEndpoint).filter(ModelEndpoint.id == body["id"]).one()
+        row.is_enabled = False
+        db.commit()
+    finally:
+        db.close()
+    blocked = client.post("/api/role-workflow/connection")
+    assert blocked.status_code == 403
+    db = SessionLocal()
+    try:
+        row = db.query(ModelEndpoint).filter(ModelEndpoint.id == body["id"]).one()
+        assert row.is_enabled is False
+        assert db.query(ModelEndpoint).filter(ModelEndpoint.owner == OWNER, ModelEndpoint.is_enabled == True).count() == 0
+    finally:
+        db.close()
+
+    monkeypatch.delenv("ODYSSEUS_ROLE_WORKFLOW", raising=False)
+    off = client.post("/api/role-workflow/connection", json={"owner": "root"})
+    assert off.status_code == 404
+    monkeypatch.setenv("ODYSSEUS_ROLE_WORKFLOW", "1")
+
+    with TestClient(client.app) as anon:
+        assert anon.post("/api/role-workflow/connection").status_code == 401
+    with TestClient(client.app) as token:
+        token.headers["x-test-api-token"] = "1"
+        assert token.post("/api/role-workflow/connection").status_code == 403
+
+    class Account:
+        def __init__(self):
+            self.calls = 0
+            self.privs = {
+                "block_all_models": True,
+                "allowed_models": [],
+                "allowed_models_restricted": False,
+                "can_use_agent": False,
+                "can_use_bash": False,
+            }
+
+        def get_privileges(self, username):
+            self.calls += 1
+            return dict(self.privs)
+
+    account = Account()
+    client.app.state.auth_manager = account
+    db = SessionLocal()
+    try:
+        db.query(ModelEndpoint).filter(ModelEndpoint.id == body["id"]).update({"is_enabled": True})
+        db.commit()
+    finally:
+        db.close()
+    denied = client.post("/api/role-workflow/connection")
+    assert denied.status_code == 403
+    assert account.calls >= 1
+    account.privs["block_all_models"] = False
+    account.privs["allowed_models_restricted"] = True
+    account.privs["allowed_models"] = [MODEL]
+    allowed = client.post("/api/role-workflow/connection")
+    assert allowed.status_code == 200
+    created = client.post("/api/role-workflow/projects", json={
+        "title": "Private",
+        "brief": "Explain rain.",
+        "endpoint_id": allowed.json()["id"],
+        "model": MODEL,
+        "owner": "root",
+    })
+    assert created.status_code == 200
+    ran = client.post(f"/api/role-workflow/projects/{created.json()['id']}/run")
+    assert ran.status_code == 200
+    assert _step(ran.json(), "writer")["output_text"] == "PRIVATE-DRAFT"
+    assert calls[0]["json"]["options"]["num_ctx"] == 2048
+    assert calls[0]["json"]["options"]["num_predict"] == 512
+    assert len(calls) == 1
+
+
+def test_role_dependency_closures_are_pinned():
+    safety = (ROOT / "requirements-role-safety.txt").read_text(encoding="utf-8")
+    runtime = (ROOT / "requirements-role-runtime.txt").read_text(encoding="utf-8")
+    bootstrap = (ROOT / "requirements-bootstrap.txt").read_text(encoding="utf-8")
+    safety_reqs = "\n".join(
+        line for line in safety.splitlines() if line.strip() and not line.lstrip().startswith("#")
+    )
+    assert "fastapi==0.162.0" in safety_reqs
+    assert "opentelemetry-api==1.45.2" in safety_reqs
+    assert "opentelemetry-sdk==" not in safety_reqs
+    assert "opentelemetry-exporter" not in safety_reqs
+    for banned in ("fastembed", "faster-whisper", "chromadb", "yt-dlp", "uvicorn"):
+        assert banned not in safety_reqs
+    assert "e9b54de76e530bb6cf0ccd036787103acb58fd42ba930ea8bf948ddbaa2f61d1" in safety
+    assert "e9b54de76e530bb6cf0ccd036787103acb58fd42ba930ea8bf948ddbaa2f61d1" in bootstrap
+    runtime_reqs = "\n".join(
+        line for line in runtime.splitlines() if line.strip() and not line.lstrip().startswith("#")
+    )
+    assert "-r requirements-role-safety.txt" in runtime_reqs
+    assert "uvicorn==0.54.0" in runtime_reqs
+    assert "python-dotenv==1.2.4" in runtime_reqs
+    assert "numpy==2.4.6" in runtime_reqs
+    assert "numpy==2.5.4" not in runtime_reqs
+    assert "fastembed" not in runtime_reqs
 

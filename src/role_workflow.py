@@ -32,6 +32,8 @@ logger = logging.getLogger(__name__)
 ENV_FEATURE = "ODYSSEUS_ROLE_WORKFLOW"
 ENV_MODELS = "ODYSSEUS_ROLE_WORKFLOW_MODELS"
 DEFAULT_MODEL = "qwen2.5:7b-instruct"
+PRIVATE_LOOPBACK_URL = "http://127.0.0.1:11434/v1"
+PRIVATE_CONNECTION_NAME = "Private loopback Ollama"
 
 MAX_CONTEXT_TOKENS = 2048
 MAX_COMPLETION_TOKENS = 512
@@ -773,6 +775,102 @@ def _arm_cancel(project_id: str) -> threading.Event:
 def _disarm_cancel(project_id: str) -> None:
     with _CANCEL_LOCK:
         _CANCEL_EVENTS.pop(project_id, None)
+
+
+def _connection_dict(endpoint: ModelEndpoint) -> dict:
+    return {
+        "id": endpoint.id,
+        "name": endpoint.name,
+        "base_url": endpoint.base_url,
+        "model": DEFAULT_MODEL,
+    }
+
+
+def _private_loopback_rows(db, owner: str) -> list:
+    """This owner's saved numeric loopback rows. Other owners are not loaded."""
+    url = normalize_loopback_ollama_url(PRIVATE_LOOPBACK_URL)
+    rows = (
+        db.query(ModelEndpoint)
+        .filter(ModelEndpoint.owner == owner)
+        .all()
+    )
+    matched = []
+    for row in rows:
+        kind = (row.model_type or "llm").strip().lower()
+        if kind not in {"llm", "auto"}:
+            continue
+        try:
+            current = normalize_loopback_ollama_url(row.base_url or "")
+        except WorkflowClosed:
+            continue
+        if current == url:
+            matched.append(row)
+    return matched
+
+
+def connect_private_model(owner: str, account_models: Optional[frozenset] = None) -> dict:
+    """Save one private loopback connection for the signed-in user.
+
+    The URL and model are fixed here. A client cannot choose a host, a key,
+    a proxy, or an owner. No catalog probe and no completion is sent.
+    A disabled connection is not replaced. Another user's row is not read
+    or updated.
+    """
+    _require_enabled()
+    if not owner:
+        raise WorkflowClosed("Not authenticated", 401)
+    ensure_tables()
+    model = DEFAULT_MODEL
+    if model not in allowed_models():
+        raise WorkflowClosed("pinned model is no longer allowed", 400)
+    _assert_account_model(model, account_models)
+    from src.ollama_context_guard import (
+        OllamaContextGuardRejected,
+        guard_mode,
+        is_guarded_local_ollama,
+    )
+
+    if guard_mode() != "enforce":
+        raise WorkflowClosed(
+            "ODYSSEUS_OLLAMA_MAX_NUM_CTX must be 2048 before a local connection can be saved",
+            400,
+        )
+    url = normalize_loopback_ollama_url(PRIVATE_LOOPBACK_URL)
+    try:
+        guarded = is_guarded_local_ollama(url)
+    except OllamaContextGuardRejected as exc:
+        raise WorkflowClosed(str(exc), 400) from exc
+    if not guarded:
+        raise WorkflowClosed("the local connection is not a guarded loopback listener", 400)
+    db = SessionLocal()
+    try:
+        rows = _private_loopback_rows(db, owner)
+        enabled = [row for row in rows if row.is_enabled]
+        if enabled:
+            enabled.sort(key=lambda row: row.id)
+            return _connection_dict(enabled[0])
+        if rows:
+            raise WorkflowClosed("the local connection is disabled", 403)
+        endpoint = ModelEndpoint(
+            id=uuid.uuid4().hex,
+            name=PRIVATE_CONNECTION_NAME,
+            base_url=url,
+            api_key=None,
+            is_enabled=True,
+            model_type="llm",
+            endpoint_kind="local",
+            supports_tools=False,
+            owner=owner,
+        )
+        db.add(endpoint)
+        db.commit()
+        db.refresh(endpoint)
+        return _connection_dict(endpoint)
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
 
 
 def create_project(

@@ -17,6 +17,7 @@ from src.role_workflow import (
     WorkflowClosed,
     account_models_from_privileges,
     cancel_project,
+    connect_private_model,
     create_project,
     feature_enabled,
     get_project,
@@ -89,6 +90,16 @@ def setup_role_workflow_routes() -> APIRouter:
         owner = _owner(request)
         try:
             return {"endpoints": list_pinned_endpoints(owner)}
+        except WorkflowClosed as exc:
+            raise _closed(exc) from exc
+
+    @router.post("/connection")
+    def workflow_connection(request: Request):
+        """Save this user's private loopback connection. The body is not read."""
+        _feature_or_404()
+        owner = _owner(request)
+        try:
+            return connect_private_model(owner, _account_models(request, owner))
         except WorkflowClosed as exc:
             raise _closed(exc) from exc
 

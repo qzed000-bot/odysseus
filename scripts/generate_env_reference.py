@@ -484,6 +484,19 @@ VARIABLE_NOTES: dict[str, tuple[str, str, str]] = {
         "Truthy logs the shape of streamed provider chunks. Debugging aid for "
         "provider response parsing.",
     ),
+    "ODYSSEUS_OLLAMA_MAX_NUM_CTX": (
+        "Model routing and providers", USER,
+        "Opt-in ceiling for configured local Ollama chat. The only enabling value "
+        "is 2048. Any other non-empty value refuses those requests before they "
+        "are sent. Unset leaves provider behavior unchanged. See "
+        "docs/ollama-context-guard.md.",
+    ),
+    "ODYSSEUS_OLLAMA_CONTEXT_BASES": (
+        "Model routing and providers", USER,
+        "Comma-separated absolute http(s) origins treated as the local Ollama "
+        "listener when ODYSSEUS_OLLAMA_MAX_NUM_CTX is enforcing. Port 11434 /v1 "
+        "is included without this. An invalid entry refuses local Ollama calls.",
+    ),
 
     # -- Agent loop and tool execution -------------------------------------
     "ODYSSEUS_TOOL_APPROVAL_GATE": (

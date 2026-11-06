@@ -839,6 +839,7 @@ def _build_ollama_payload(
     stream: bool = False,
     tools: Optional[List[Dict]] = None,
     num_ctx: Optional[int] = None,
+    endpoint_url: str = "",
 ) -> Dict:
     """Build the JSON payload for Ollama's /api/chat endpoint.
 
@@ -850,6 +851,9 @@ def _build_ollama_payload(
     the value is trusted (not the ``DEFAULT_CONTEXT`` fallback), so we
     don't guess for unknown models but do tell Ollama the real window
     when we know it — even if it's smaller than 2048.
+
+    When the local Ollama context guard is enforcing, ``endpoint_url`` selects
+    that listener and the emitted ``num_ctx`` is at most 2048.
     """
     payload: Dict = {
         "model": model,
@@ -861,8 +865,13 @@ def _build_ollama_payload(
         options["temperature"] = temperature
     if max_tokens and max_tokens > 0:
         options["num_predict"] = max_tokens
-    if num_ctx is not None and num_ctx > 0 and num_ctx != DEFAULT_CONTEXT:
-        options["num_ctx"] = num_ctx
+    from src.ollama_context_guard import OllamaContextGuardRejected, num_ctx_for_payload
+    try:
+        emitted_num_ctx = num_ctx_for_payload(endpoint_url, num_ctx)
+    except OllamaContextGuardRejected as exc:
+        raise _FallbackIneligibleHTTPException(400, str(exc)) from exc
+    if emitted_num_ctx is not None:
+        options["num_ctx"] = emitted_num_ctx
     if options:
         payload["options"] = options
     if tools:
@@ -1106,6 +1115,64 @@ def _detect_provider(url: str) -> str:
     if _host_match(url, "mistral.ai"):
         return "mistral"
     return "openai"
+
+
+def _dispatch_provider(url: str) -> str:
+    """Provider for a chat call, after the local Ollama context guard.
+
+    The guard can force a local Ollama ``/v1`` URL onto the native provider
+    and can refuse the call before any bytes are sent. Other URLs are unchanged.
+    """
+    from src.ollama_context_guard import OllamaContextGuardRejected, dispatch_provider
+    try:
+        return dispatch_provider(url, _detect_provider(url))
+    except OllamaContextGuardRejected as exc:
+        raise _FallbackIneligibleHTTPException(400, str(exc)) from exc
+
+
+def _ollama_post_url(url: str) -> str:
+    """Chat URL for a native Ollama post, including guarded ``/v1`` bases."""
+    from src.ollama_context_guard import native_chat_url
+    return native_chat_url(url, _normalize_ollama_url(url))
+
+
+def guarded_chat_post(url: str, payload: dict) -> tuple[str, dict, str]:
+    """Apply the local Ollama cap to a caller-built chat body.
+
+    Returns ``(post_url, body, dialect)``. ``dialect`` is ``ollama`` when the
+    body was rewritten to native ``/api/chat``; otherwise ``openai`` or
+    ``anthropic`` and the caller's payload is unchanged. An invalid guard
+    raises before this returns, so the caller must not post on that exception.
+    """
+    provider = _dispatch_provider(url)
+    if provider != "ollama":
+        dialect = "anthropic" if provider == "anthropic" else "openai"
+        return url, payload, dialect
+    messages = payload.get("messages") or []
+    model = str(payload.get("model") or "")
+    temperature = payload.get("temperature", 0.0)
+    raw_max = payload.get("max_tokens", payload.get("max_completion_tokens", 0))
+    try:
+        max_tokens = int(raw_max or 0)
+    except (TypeError, ValueError):
+        max_tokens = 0
+    native = _build_ollama_payload(
+        model,
+        messages,
+        0.0 if temperature is None else temperature,
+        max_tokens,
+        stream=bool(payload.get("stream")),
+        tools=payload.get("tools"),
+        num_ctx=get_context_length(url, model),
+        endpoint_url=url,
+    )
+    response_format = payload.get("response_format")
+    if isinstance(response_format, dict) and response_format.get("type") == "json_object":
+        native["format"] = "json"
+    thinking = payload.get("chat_template_kwargs")
+    if isinstance(thinking, dict) and thinking.get("enable_thinking") is False:
+        native["think"] = False
+    return _ollama_post_url(url), native, "ollama"
 
 
 def _is_self_hosted_openai_compatible(url: str) -> bool:
@@ -2288,7 +2355,7 @@ def llm_call(url: str, model: str, messages: List[Dict], temperature: float = LL
              thinking_mode: Optional[str] = None,
              reasoning_effort: Optional[str] = None) -> str:
     """Synchronous LLM call with optional prompt type enhancement."""
-    h = _provider_headers(_detect_provider(url))
+    h = _provider_headers(_dispatch_provider(url))
     # Tolerate headers that arrive as a JSON string (some sessions stored them
     # double-encoded) — otherwise h.update() throws "dictionary update sequence
     # element #0 has length 1; 2 is required".
@@ -2315,7 +2382,7 @@ def llm_call(url: str, model: str, messages: List[Dict], temperature: float = LL
     else:
         messages_copy = non_sys
 
-    provider = _detect_provider(url)
+    provider = _dispatch_provider(url)
     cache_key = _get_cache_key(
         url, model, messages_copy, temperature, max_tokens, headers=headers,
         thinking_mode=thinking_mode, reasoning_effort=reasoning_effort,
@@ -2330,10 +2397,11 @@ def llm_call(url: str, model: str, messages: List[Dict], temperature: float = LL
         h = _build_anthropic_headers(headers)
         payload = _build_anthropic_payload(model, messages_copy, temperature, max_tokens)
     elif provider == "ollama":
-        target_url = _normalize_ollama_url(url)
+        target_url = _ollama_post_url(url)
         payload = _build_ollama_payload(
             model, messages_copy, temperature, max_tokens,
             stream=False, num_ctx=get_context_length(url, model),
+            endpoint_url=url,
         )
     else:
         target_url = _normalize_openai_chat_url(url)
@@ -2473,6 +2541,8 @@ def llm_call_with_fallback(candidates, messages, **kwargs) -> str:
         try:
             return llm_call(url, model, messages, headers=headers, **kwargs)
         except Exception as e:
+            if getattr(e, "fallback_eligible", None) is False:
+                raise
             last_err = e
             tag = "primary" if i == 0 else "candidate"
             logger.warning(f"[fallback] {tag} {model} failed ({type(e).__name__}); trying next")
@@ -2506,6 +2576,8 @@ async def llm_call_async_with_fallback(candidates, messages, **kwargs) -> str:
                 url, model, candidate_messages, headers=headers, **candidate_kwargs
             )
         except Exception as e:
+            if getattr(e, "fallback_eligible", None) is False:
+                raise
             last_err = e
             tag = "primary" if i == 0 else "candidate"
             logger.warning(f"[fallback] {tag} {model} failed ({type(e).__name__}); trying next")
@@ -2618,7 +2690,7 @@ async def llm_call_async(
     reasoning_effort: Optional[str] = None,
 ) -> str | tuple[str, str]:
     """Asynchronous LLM call using httpx with connection pooling, timeout, retry logic, and performance logging."""
-    provider = _detect_provider(url)
+    provider = _dispatch_provider(url)
     messages_copy = _sanitize_llm_messages(messages)
 
     # Consolidate multiple system messages into one at the start.
@@ -2732,13 +2804,14 @@ async def llm_call_async(
         h = _build_anthropic_headers(headers)
         payload = _build_anthropic_payload(model, messages_copy, temperature, max_tokens)
     elif provider == "ollama":
-        target_url = _normalize_ollama_url(url)
+        target_url = _ollama_post_url(url)
         h = {"Content-Type": "application/json"}
         if headers:
             h.update(headers)
         payload = _build_ollama_payload(
             model, messages_copy, temperature, max_tokens,
             stream=False, num_ctx=get_context_length(url, model),
+            endpoint_url=url,
         )
     else:
         target_url = _normalize_openai_chat_url(url)
@@ -2920,11 +2993,11 @@ async def llm_call_async(
             )
 
 def _stream_target_url(url: str) -> str:
-    provider = _detect_provider(url)
+    provider = _dispatch_provider(url)
     if provider == "anthropic":
         return _normalize_anthropic_url(url)
     if provider == "ollama":
-        return _normalize_ollama_url(url)
+        return _ollama_post_url(url)
     if provider == "chatgpt-subscription":
         return _normalize_chatgpt_subscription_url(url)
     return _normalize_openai_chat_url(url)
@@ -2971,7 +3044,7 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
       - event: error                       — errors
       - data: [DONE]                       — end of stream
     """
-    provider = _detect_provider(url)
+    provider = _dispatch_provider(url)
     messages_copy = _sanitize_llm_messages(messages)
 
     # Consolidate multiple system messages into one at the start.
@@ -2993,13 +3066,14 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
         h = _build_anthropic_headers(headers)
         payload = _build_anthropic_payload(model, messages_copy, temperature, max_tokens, stream=True, tools=tools)
     elif provider == "ollama":
-        target_url = _normalize_ollama_url(url)
+        target_url = _ollama_post_url(url)
         h = {"Content-Type": "application/json"}
         if headers:
             h.update(headers)
         payload = _build_ollama_payload(
             model, messages_copy, temperature, max_tokens,
             stream=True, tools=tools, num_ctx=get_context_length(url, model),
+            endpoint_url=url,
         )
     elif provider == "chatgpt-subscription":
         target_url = _normalize_chatgpt_subscription_url(url)

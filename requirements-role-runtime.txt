@@ -1,0 +1,32 @@
+# Bounded process closure for serving this tree. It includes the safety
+# closure plus the packages a process import reached before the embedding,
+# audio, and MCP stacks. numpy is required by that import. fastembed,
+# chromadb, faster-whisper, yt-dlp, and mcp are not included.
+# Install requirements-bootstrap.txt first, then:
+#   python -m pip install --require-hashes --only-binary=:all: --no-deps -r requirements-role-runtime.txt
+# Do not install opentelemetry-sdk or an OTLP exporter. Do not set
+# OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_TRACES_EXPORTER, or OTEL_METRICS_EXPORTER.
+# numpy 2.5.4 has no CPython 3.11 Windows wheel. 2.4.6 is the pin because it
+# has both a CPython 3.11 Windows x64 wheel and a CPython 3.12 manylinux wheel.
+-r requirements-role-safety.txt
+beautifulsoup4==4.15.0 \
+    --hash=sha256:d6f88de62e1d4e38ecb1077eb9724cd0eff29d2a08ca16a401e9b9e93f117cf9
+click==8.5.0 \
+    --hash=sha256:255bc9599cf7748b4b1a446ccc735421bd08a2ae529a8b88597d3de5664ee360
+numpy==2.4.6 \
+    --hash=sha256:1e254a00cdf42b1e4d5b3d68d33af63268d41340d8885df2ab6470f2e1500147 \
+    --hash=sha256:90f9849678c75fe7afa2d348ac842c168b0a4d3d61919687216dfc547976d853
+pydantic-settings==2.16.2 \
+    --hash=sha256:8d523e5c129b097686bde019bd6109bff53f4c8c3f63f1ddf9933ffa42e5ab4f
+python-dateutil==4.0.0 \
+    --hash=sha256:a5e246f79eb80475e691bf93862cead98decd8a498cf53ba0516fcdc0f50dc1c
+python-dotenv==1.2.4 \
+    --hash=sha256:42269a8a5b3fd54ffa6f3d84b18abed50064717576b4ecf03dc4a55d8aa04fdc
+python-multipart==0.0.33 \
+    --hash=sha256:8f16c07b36add9da6b2ee87d3efcaf0a45a6de9c3d0a5dd94e9ccf7675a7bc45
+soupsieve==4.0.1 \
+    --hash=sha256:2e68cf7dd5a0f29d81f9d485275ccf294e6475f615e211895d91cb81f8614f04
+tzdata==2026.6 \
+    --hash=sha256:0a10eec6e13ef16b627fabed9a5f2ba61a62b1c67f327305f4e7e412a70b4aec
+uvicorn==0.54.0 \
+    --hash=sha256:505bdb0f318731d45f1f712071fc781a8981f6847a31c902c9f5e652d4f67faf

@@ -252,6 +252,83 @@ def _normalize_image_endpoint_base(url: str) -> str:
     return base
 
 
+class _GalleryVisionError(Exception):
+    """Vision completion failed after the request was allowed."""
+
+
+async def post_gallery_ai_tag(chat_url: str, model_name: str, headers, mime: str, b64: str) -> str:
+    """Ask the configured vision model for tags.
+
+    Guarded local Ollama is sent as native ``/api/chat`` with ``num_ctx`` at
+    most 2048. An invalid cap raises before any completion POST.
+    """
+    import httpx
+    from src.llm_core import (
+        _FallbackIneligibleHTTPException,
+        _dispatch_provider,
+        _parse_ollama_response,
+        _restricts_temperature,
+        _uses_max_completion_tokens,
+        guarded_chat_post,
+    )
+    try:
+        provider = _dispatch_provider(chat_url)
+    except _FallbackIneligibleHTTPException:
+        raise
+    tag_prompt = (
+        "Analyze this photo. Return ONLY a comma-separated list of tags. "
+        "Include: objects, people (describe by appearance — age range, gender), "
+        "scene/setting, activities, mood/atmosphere, colors, location type, "
+        "time of day, weather if visible, any text/signs visible. "
+        "Be specific but concise. 10-25 tags. No explanation, just tags."
+    )
+    if provider == "anthropic":
+        payload = {
+            "model": model_name,
+            "max_tokens": 200,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "image", "source": {
+                        "type": "base64", "media_type": mime, "data": b64,
+                    }},
+                    {"type": "text", "text": tag_prompt},
+                ],
+            }],
+        }
+    else:
+        token_key = "max_completion_tokens" if _uses_max_completion_tokens(model_name) else "max_tokens"
+        payload = {
+            "model": model_name,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": tag_prompt},
+                    {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
+                ],
+            }],
+            token_key: 200,
+            "temperature": 0.3,
+        }
+        if _restricts_temperature(model_name):
+            payload.pop("temperature", None)
+    request_headers = {"Content-Type": "application/json"}
+    if headers:
+        request_headers.update(headers)
+    post_url, payload, dialect = guarded_chat_post(chat_url, payload)
+    async with httpx.AsyncClient(timeout=60) as client:
+        resp = await client.post(post_url, json=payload, headers=request_headers)
+    if resp.status_code != 200:
+        logger.error("ai_tag vision model: status %s: %s", resp.status_code, resp.text[:500])
+        raise _GalleryVisionError("Vision model request failed")
+    data = resp.json()
+    if provider == "anthropic":
+        return (data.get("content") or [{}])[0].get("text", "")
+    if dialect == "ollama":
+        return _parse_ollama_response(data)
+    return data.get("choices", [{}])[0].get("message", {}).get("content", "")
+
+
 def _is_openai_api_base(url: str) -> bool:
     """Return True only when url's hostname is exactly api.openai.com."""
     from urllib.parse import urlsplit
@@ -2296,64 +2373,10 @@ def setup_gallery_routes() -> APIRouter:
             if not chat_url:
                 return {"error": "No vision-capable endpoint configured"}
 
-            # Call vision model — format differs between Anthropic and OpenAI
-            from src.llm_core import _detect_provider, _restricts_temperature, _uses_max_completion_tokens
-            provider = _detect_provider(chat_url)
-            tag_prompt = (
-                "Analyze this photo. Return ONLY a comma-separated list of tags. "
-                "Include: objects, people (describe by appearance — age range, gender), "
-                "scene/setting, activities, mood/atmosphere, colors, location type, "
-                "time of day, weather if visible, any text/signs visible. "
-                "Be specific but concise. 10-25 tags. No explanation, just tags."
-            )
-
-            if provider == "anthropic":
-                payload = {
-                    "model": model_name,
-                    "max_tokens": 200,
-                    "messages": [{
-                        "role": "user",
-                        "content": [
-                            {"type": "image", "source": {
-                                "type": "base64", "media_type": mime, "data": b64,
-                            }},
-                            {"type": "text", "text": tag_prompt},
-                        ],
-                    }],
-                }
-            else:
-                _tok_key = "max_completion_tokens" if _uses_max_completion_tokens(model_name) else "max_tokens"
-                payload = {
-                    "model": model_name,
-                    "messages": [{
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": tag_prompt},
-                            {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
-                        ],
-                    }],
-                    _tok_key: 200,
-                    "temperature": 0.3,
-                }
-                # Reasoning models (o1/o3/o4/gpt-5) reject an explicit temperature.
-                if _restricts_temperature(model_name):
-                    payload.pop("temperature", None)
-
-            h = {"Content-Type": "application/json"}
-            if headers:
-                h.update(headers)
-
-            async with httpx.AsyncClient(timeout=60) as client:
-                resp = await client.post(chat_url, json=payload, headers=h)
-                if resp.status_code != 200:
-                    logger.error("ai_tag vision model: status %s: %s", resp.status_code, resp.text[:500])
-                    return {"error": "Vision model request failed"}
-                data = resp.json()
-                # Anthropic returns content[0].text, OpenAI returns choices[0].message.content
-                if provider == "anthropic":
-                    content = (data.get("content") or [{}])[0].get("text", "")
-                else:
-                    content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            try:
+                content = await post_gallery_ai_tag(chat_url, model_name, headers, mime, b64)
+            except _GalleryVisionError as exc:
+                return {"error": exc.args[0] if exc.args else "Vision model request failed"}
 
             # Clean up tags
             tags = [t.strip().lower() for t in content.split(",") if t.strip()]

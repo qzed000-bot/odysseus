@@ -43,7 +43,22 @@ It does not apply to Ollama Cloud (`ollama.com`) or to other loopback OpenAI
 servers such as LM Studio on port 1234. Those keep their existing request
 shape.
 
-This does not sandbox the process, limit VRAM by itself, or change tool
-permissions. The running Ollama still has to accept the native `num_ctx`
-field. Confirm that on the target machine before pointing Odysseus at a GPU
-model.
+Admin model probe, gallery auto-tag, and the email-task classifier use the
+same cap. They post native `/api/chat` with `num_ctx` at most 2048, or they
+fail before any completion request when the setting is invalid. The legacy
+`llm_call_with_fallback` and `llm_call_async_with_fallback` helpers do not
+send the prompt to another candidate after that configuration rejection.
+
+`/v1` matching ignores path case, so `http://127.0.0.1:11434/V1` is covered.
+A non-11434 `/v1` base is still not assumed to be Ollama unless it is listed
+in `ODYSSEUS_OLLAMA_CONTEXT_BASES`. A malformed entry in that list refuses
+loopback calls; it does not by itself stop an unrelated non-loopback URL.
+
+Prompt trimming still uses the model's advertised window from
+`get_context_length`. The loaded context is the `num_ctx` on the request.
+A long transcript can be rejected or truncated by Ollama; it must not cause
+a larger loaded window. This is not a VRAM limiter.
+
+This does not sandbox the process or change tool permissions. The running
+Ollama still has to accept the native `num_ctx` field. Confirm that on the
+target machine before pointing Odysseus at a GPU model.

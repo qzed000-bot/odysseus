@@ -57,7 +57,13 @@ class _Recorder(BaseHTTPRequestHandler):
             self._send(status, b'{"error":"unavailable"}', "application/json")
             return
         if path.startswith("/api/"):
-            line = b'{"message":{"content":"ok"},"done":true}\n'
+            content = getattr(self.server, "native_content", "ok")
+            line = json.dumps({
+                "message": {"content": content},
+                "done": True,
+                "prompt_eval_count": 3,
+                "eval_count": 1,
+            }).encode() + b"\n"
             payload = line if body.get("stream") else line.strip()
             self._send(200, payload, "application/x-ndjson")
             return
@@ -372,6 +378,169 @@ async def test_streaming_native_and_v1_are_capped(monkeypatch, capture):
     assert [post["path"] for post in capture.posts] == ["/api/chat", "/api/chat"]
     assert all(post["body"].get("stream") is True for post in capture.posts)
     assert all(_num_ctx(post["body"]) == 2048 for post in capture.posts)
+
+
+def test_uppercase_v1_on_port_11434_is_guarded_without_connecting(monkeypatch):
+    monkeypatch.setenv(ENV_MAX_NUM_CTX, "2048")
+    monkeypatch.delenv(ENV_CONTEXT_BASES, raising=False)
+    assert is_guarded_local_ollama("http://127.0.0.1:11434/V1") is True
+    assert llm_core._dispatch_provider("http://127.0.0.1:11434/V1") == "ollama"
+    assert llm_core._ollama_post_url("http://127.0.0.1:11434/V1") == "http://127.0.0.1:11434/api/chat"
+
+
+def test_builder_without_endpoint_fails_closed_when_guard_is_set(monkeypatch):
+    monkeypatch.setenv(ENV_MAX_NUM_CTX, "2048")
+    with pytest.raises(HTTPException) as caught:
+        llm_core._build_ollama_payload(
+            MODEL,
+            [{"role": "user", "content": "no endpoint"}],
+            0.0,
+            5,
+            num_ctx=131072,
+        )
+    assert caught.value.status_code == 400
+    assert getattr(caught.value, "fallback_eligible", None) is False
+
+
+def test_probe_native_and_v1_are_capped(monkeypatch, capture):
+    from routes.model_routes import _probe_single_model
+
+    monkeypatch.setenv(ENV_MAX_NUM_CTX, "2048")
+    base = _base(capture)
+    monkeypatch.setenv(ENV_CONTEXT_BASES, base + "/v1")
+    for endpoint in (base + "/v1", base + "/api"):
+        capture.posts.clear()
+        llm_core._response_cache.clear()
+        result = _probe_single_model(endpoint, "", MODEL)
+        assert result["status"] == "ok", result
+        assert capture.posts[-1]["path"] == "/api/chat"
+        assert _num_ctx(capture.posts[-1]["body"]) == 2048
+
+
+def test_probe_invalid_cap_posts_nothing(monkeypatch, capture):
+    from routes.model_routes import _probe_single_model
+
+    monkeypatch.setenv(ENV_MAX_NUM_CTX, "0")
+    result = _probe_single_model(_base(capture) + "/api", "", MODEL)
+    assert result["status"] == "fail"
+    assert capture.posts == []
+    assert capture.gets == []
+
+
+async def test_gallery_ai_tag_native_and_v1_are_capped(monkeypatch, capture):
+    from routes.gallery.gallery_routes import post_gallery_ai_tag
+
+    monkeypatch.setenv(ENV_MAX_NUM_CTX, "2048")
+    base = _base(capture)
+    monkeypatch.setenv(ENV_CONTEXT_BASES, base + "/v1")
+    capture.native_content = "cat, sun"
+    for endpoint in (base + "/v1", base + "/api"):
+        capture.posts.clear()
+        text = await post_gallery_ai_tag(endpoint, MODEL, None, "image/png", "aaaa")
+        assert "cat" in text
+        assert capture.posts[-1]["path"] == "/api/chat"
+        assert _num_ctx(capture.posts[-1]["body"]) <= 2048
+
+
+async def test_gallery_ai_tag_invalid_cap_posts_nothing(monkeypatch, capture):
+    from routes.gallery.gallery_routes import post_gallery_ai_tag
+
+    monkeypatch.setenv(ENV_MAX_NUM_CTX, "no")
+    with pytest.raises(HTTPException):
+        await post_gallery_ai_tag(_base(capture) + "/api", MODEL, None, "image/png", "aaaa")
+    assert capture.posts == []
+
+
+async def test_email_classifier_native_and_v1_are_capped(monkeypatch, capture):
+    import httpx
+    from src.email_task_intent import classify_email_task
+
+    monkeypatch.setenv(ENV_MAX_NUM_CTX, "2048")
+    base = _base(capture)
+    monkeypatch.setenv(ENV_CONTEXT_BASES, base + "/v1")
+    capture.native_content = json.dumps({
+        "operation": "other",
+        "dependencies": [],
+        "summary": "none",
+        "destination": "chat",
+        "needs_clarification": False,
+        "requires_content": False,
+    })
+    async with httpx.AsyncClient() as client:
+        for endpoint in (base + "/v1", base + "/api"):
+            capture.posts.clear()
+            intent = await classify_email_task(
+                client,
+                endpoint_url=endpoint,
+                headers={},
+                model=MODEL,
+                history=[{"role": "user", "content": "Hello"}],
+            )
+            assert intent.operation == "other"
+            assert capture.posts[-1]["path"] == "/api/chat"
+            assert _num_ctx(capture.posts[-1]["body"]) <= 2048
+
+
+async def test_email_classifier_invalid_cap_posts_nothing(monkeypatch, capture):
+    import httpx
+    from src.email_task_intent import classify_email_task
+
+    monkeypatch.setenv(ENV_MAX_NUM_CTX, "4096")
+    async with httpx.AsyncClient() as client:
+        with pytest.raises(HTTPException):
+            await classify_email_task(
+                client,
+                endpoint_url=_base(capture) + "/api",
+                headers={},
+                model=MODEL,
+                history=[{"role": "user", "content": "Hello"}],
+            )
+    assert capture.posts == []
+
+
+def test_sync_and_async_fallback_do_not_forward_invalid_cap(monkeypatch):
+    monkeypatch.setenv(ENV_MAX_NUM_CTX, "0")
+    seen = []
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        seen.append(url)
+        raise AssertionError("completion post during invalid cap: " + url)
+
+    monkeypatch.setattr(llm_core.httpx, "post", fake_post)
+    llm_core._response_cache.clear()
+    candidates = [
+        ("http://127.0.0.1:11434/v1", MODEL, None),
+        ("https://api.openai.com/v1", "gpt-4o", None),
+    ]
+    messages = [{"role": "user", "content": "do not forward this"}]
+    with pytest.raises(HTTPException) as caught:
+        llm_core.llm_call_with_fallback(candidates, messages, max_tokens=4)
+    assert caught.value.status_code == 400
+    assert seen == []
+
+
+async def test_async_fallback_does_not_forward_invalid_cap(monkeypatch):
+    monkeypatch.setenv(ENV_MAX_NUM_CTX, "2048abc")
+    seen = []
+
+    async def fake_post(self, url, headers=None, json=None, timeout=None):
+        seen.append(url)
+        raise AssertionError("async completion post during invalid cap: " + url)
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+    llm_core._response_cache.clear()
+    candidates = [
+        ("http://127.0.0.1:11434/api", MODEL, None),
+        ("https://api.openai.com/v1", "gpt-4o", None),
+    ]
+    with pytest.raises(HTTPException) as caught:
+        await llm_core.llm_call_async_with_fallback(
+            candidates,
+            [{"role": "user", "content": "do not forward this either"}],
+            max_tokens=4,
+        )
+    assert caught.value.status_code == 400
+    assert seen == []
 
 
 async def test_async_retry_reuses_capped_body(monkeypatch, capture):

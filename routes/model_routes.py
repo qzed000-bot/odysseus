@@ -754,7 +754,11 @@ def _resolve_probe_key(ep) -> Optional[str]:
 
 def _probe_single_model(base: str, api_key: str, model_id: str, timeout: int = 10, with_tools: bool = False) -> dict:
     """Send a realistic completion request to a single model. Returns {status, latency_ms, error?}."""
-    provider = _safe_detect_provider(base)
+    from src.llm_core import _FallbackIneligibleHTTPException, _dispatch_provider
+    try:
+        provider = _dispatch_provider(base)
+    except _FallbackIneligibleHTTPException as exc:
+        return {"status": "fail", "latency_ms": 0, "error": str(exc.detail)[:120]}
     if _is_discovery_only_provider(provider):
         return {"status": "ok", "latency_ms": 0, "skipped": True}
     messages = [
@@ -773,11 +777,14 @@ def _probe_single_model(base: str, api_key: str, model_id: str, timeout: int = 1
         if _test_tools:
             payload["tools"] = [{"name": "test", "description": "Test tool", "input_schema": {"type": "object", "properties": {}}}]
     elif provider == "ollama":
-        from src.llm_core import _build_ollama_payload
-        target_url = build_chat_url(base)
+        from src.llm_core import _build_ollama_payload, _ollama_post_url, get_context_length
+        target_url = _ollama_post_url(base)
         h = _safe_build_headers(api_key, base)
         h["Content-Type"] = "application/json"
-        payload = _build_ollama_payload(model_id, messages, 0.0, 5, stream=False, tools=_test_tools)
+        payload = _build_ollama_payload(
+            model_id, messages, 0.0, 5, stream=False, tools=_test_tools,
+            num_ctx=get_context_length(base, model_id), endpoint_url=base,
+        )
     else:
         target_url = build_chat_url(base)
         h = _safe_build_headers(api_key, base)

@@ -865,8 +865,11 @@ def _build_ollama_payload(
         options["temperature"] = temperature
     if max_tokens and max_tokens > 0:
         options["num_predict"] = max_tokens
-    from src.ollama_context_guard import num_ctx_for_payload
-    emitted_num_ctx = num_ctx_for_payload(endpoint_url, num_ctx)
+    from src.ollama_context_guard import OllamaContextGuardRejected, num_ctx_for_payload
+    try:
+        emitted_num_ctx = num_ctx_for_payload(endpoint_url, num_ctx)
+    except OllamaContextGuardRejected as exc:
+        raise _FallbackIneligibleHTTPException(400, str(exc)) from exc
     if emitted_num_ctx is not None:
         options["num_ctx"] = emitted_num_ctx
     if options:
@@ -1124,13 +1127,52 @@ def _dispatch_provider(url: str) -> str:
     try:
         return dispatch_provider(url, _detect_provider(url))
     except OllamaContextGuardRejected as exc:
-        raise HTTPException(400, str(exc)) from exc
+        raise _FallbackIneligibleHTTPException(400, str(exc)) from exc
 
 
 def _ollama_post_url(url: str) -> str:
     """Chat URL for a native Ollama post, including guarded ``/v1`` bases."""
     from src.ollama_context_guard import native_chat_url
     return native_chat_url(url, _normalize_ollama_url(url))
+
+
+def guarded_chat_post(url: str, payload: dict) -> tuple[str, dict, str]:
+    """Apply the local Ollama cap to a caller-built chat body.
+
+    Returns ``(post_url, body, dialect)``. ``dialect`` is ``ollama`` when the
+    body was rewritten to native ``/api/chat``; otherwise ``openai`` or
+    ``anthropic`` and the caller's payload is unchanged. An invalid guard
+    raises before this returns, so the caller must not post on that exception.
+    """
+    provider = _dispatch_provider(url)
+    if provider != "ollama":
+        dialect = "anthropic" if provider == "anthropic" else "openai"
+        return url, payload, dialect
+    messages = payload.get("messages") or []
+    model = str(payload.get("model") or "")
+    temperature = payload.get("temperature", 0.0)
+    raw_max = payload.get("max_tokens", payload.get("max_completion_tokens", 0))
+    try:
+        max_tokens = int(raw_max or 0)
+    except (TypeError, ValueError):
+        max_tokens = 0
+    native = _build_ollama_payload(
+        model,
+        messages,
+        0.0 if temperature is None else temperature,
+        max_tokens,
+        stream=bool(payload.get("stream")),
+        tools=payload.get("tools"),
+        num_ctx=get_context_length(url, model),
+        endpoint_url=url,
+    )
+    response_format = payload.get("response_format")
+    if isinstance(response_format, dict) and response_format.get("type") == "json_object":
+        native["format"] = "json"
+    thinking = payload.get("chat_template_kwargs")
+    if isinstance(thinking, dict) and thinking.get("enable_thinking") is False:
+        native["think"] = False
+    return _ollama_post_url(url), native, "ollama"
 
 
 def _is_self_hosted_openai_compatible(url: str) -> bool:
@@ -2499,6 +2541,8 @@ def llm_call_with_fallback(candidates, messages, **kwargs) -> str:
         try:
             return llm_call(url, model, messages, headers=headers, **kwargs)
         except Exception as e:
+            if getattr(e, "fallback_eligible", None) is False:
+                raise
             last_err = e
             tag = "primary" if i == 0 else "candidate"
             logger.warning(f"[fallback] {tag} {model} failed ({type(e).__name__}); trying next")
@@ -2532,6 +2576,8 @@ async def llm_call_async_with_fallback(candidates, messages, **kwargs) -> str:
                 url, model, candidate_messages, headers=headers, **candidate_kwargs
             )
         except Exception as e:
+            if getattr(e, "fallback_eligible", None) is False:
+                raise
             last_err = e
             tag = "primary" if i == 0 else "candidate"
             logger.warning(f"[fallback] {tag} {model} failed ({type(e).__name__}); trying next")

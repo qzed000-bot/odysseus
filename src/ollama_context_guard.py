@@ -95,7 +95,7 @@ def _is_ollama_cloud(url: str) -> bool:
 
 def _path(url: str) -> str:
     try:
-        return (urlparse(url).path or "").rstrip("/")
+        return (urlparse(url).path or "").rstrip("/").casefold()
     except Exception:
         return ""
 
@@ -113,7 +113,7 @@ def _is_native_ollama_shape(url: str) -> bool:
     except Exception:
         return False
     host = (parsed.hostname or "").lower()
-    path = (parsed.path or "").rstrip("/")
+    path = _path(url)
     if path.startswith("/v1"):
         return False
     local = host in _LOOPBACK_HOSTS or parsed.port == 11434
@@ -127,7 +127,7 @@ def _is_port_11434_v1(url: str) -> bool:
         return False
     if parsed.port != 11434:
         return False
-    path = (parsed.path or "").rstrip("/")
+    path = _path(url)
     return path == "/v1" or path.startswith("/v1/")
 
 
@@ -213,7 +213,16 @@ def num_ctx_for_payload(url: str, num_ctx: Optional[int]) -> Optional[int]:
     by a later request. Enforcement always emits an integer ``<= 2048``.
     """
     mode = guard_mode()
-    if mode == "off" or not is_guarded_local_ollama(url):
+    if mode == "off":
+        if num_ctx is not None and num_ctx > 0 and num_ctx != _default_context():
+            return int(num_ctx)
+        return None
+    if not (url or "").strip():
+        _reject(
+            f"{ENV_MAX_NUM_CTX} is set, but this Ollama payload has no endpoint URL. "
+            "Refusing to emit an uncapped num_ctx."
+        )
+    if not is_guarded_local_ollama(url):
         if num_ctx is not None and num_ctx > 0 and num_ctx != _default_context():
             return int(num_ctx)
         return None
